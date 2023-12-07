@@ -1,0 +1,423 @@
+---
+title: "Series de tiempo para datos discretos"
+author: "Andrés, Sofia y Julieta"
+format: html
+editor: visual
+---
+
+```{r}
+#| results: hide
+#| warning: false
+#| echo: false
+
+# Librerias
+library(tscount)
+library(TSstudio)
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(astsa)
+library(feasts)
+library(fable)
+library(timetk)
+library(tsibble)
+library(zoo)
+library(xts)
+library(readxl)
+library(tidyverse)
+library(forecast)
+library(plotly)
+
+# Directorio
+setwd("C:/Users/andre/OneDrive/Escritorio/Andrés/2023-2/Series de tiempo/Exposición/Aplicación")
+```
+
+# corregir esos títulos de las funciones xq hay unas que usan q y son inar entonces está raro
+
+# comentar lo de implementacion de los modelos
+
+# Definición de funciones
+
+## Cálculo de la matriz de transición del proceso INAR(1)
+
+Teniendo en cuenta que $\nu$ corresponde al parámetro de innovación del modelo, $\alpha$ al parámetro autoregresivo y *upper limit* al límite superior en el cual truncar el espacio de estados del modelo. Se calculan las probabilidades de inmigración en cada estado, utilizando la función *dpois()* la cual calcula la función de masa de probabilidad de la distribución Poisson con parámetro $\nu$ para valores de $0$ a *upper limit*, luego se almacenan en la matriz de transición y retorna la matriz.
+
+```{r}
+#J
+# Creación de la función
+get_transition_matrix<-function(nu,alpha,upper_limit){
+  n_states<-upper_limit+1 # Se define como el número de estados posibles en el proceso INAR(1)
+  immigration_probs<-dpois(0:upper_limit,nu) # Calcula las probabilidades de inmigración en cada estado 
+  matr <- matrix(nrow = n_states, ncol = n_states) # Almacenando la matriz de transición. 
+  for(from in 0:upper_limit){
+    for(to in 0:upper_limit){
+      matr[from + 1, to + 1] = sum(immigration_probs*dbinom(to - 0:upper_limit, size = from, prob = alpha))
+    }
+  } # En el anterior for se esta introduciendo las probabilidades de transición dentro de la matriz creada.
+  return(matr) # returna la matriz 
+}
+```
+
+## Modelo INAR(1)
+
+Teniendo en cuenta que *vect* es un vector que contiene la serie de tiempo, y los argumentos que pasan directamente a la función *optim*, esta función devuelve los parámetros del modelo, la logverosimilitud y la cantidad de parámetros. Se calcula la logverosimilitud negativa que luego se pasa a la función *optim*, es negativa porque minimiza. Para encontrar los parámetros óptimos se hace exponenciación dado que están en escala logaritmica.
+
+```{r}
+#J
+fit_inar2<-function(vect, ...){
+  # Calcular la logverosimilitud negativa
+  nllik<-function(pars){
+    -llik_inar(vect,nu=exp(pars["log_nu"]),
+               alpha=exp(pars["logit_alpha"])/(1+exp(pars["logit_alpha"]))                      )
+  }
+  # Optimizar la logverosimilitud negativa
+  opt<-optim(c(log_nu=2,logit_alpha=0.5),nllik, ...)
+  par<-c(tau=exp(opt$par["log_nu"]),
+         alpha=exp(opt$par["logit_alpha"])/(1+exp(opt$par["logit_alpha"]))) # Exponenciar porque está en escala logarítmica
+  llik<- -opt$value
+  names(par)<-c("nu", "alpha")
+  return(list(par=par,llik=llik,dim=2,opt=opt))
+}
+```
+
+## Evaluar la logverosimilitud del proceso INAR(1)
+
+Esto se usa para observar la adecuación del modelo a los datos de conteo, los argumentos son los siguientes: *vect* el cual contiene un vector con la serie temporal observada, $\nu$ y $\alpha$, parámetros del proceso INAR(1) y, *return_fitted* que es un argumento opcional que determina si se deben devolver los valores ajustados o no. Además, se tiene que *upper limit* representa el límite superior del espacio de estado en el proceso INAR(1) y se utiliza para definir el tamaño de la matriz de transición. Se calcula la logverosimilitud, los valores ajustados y las varianzas ajustada (en caso de pedirselo), si no se pide, retorna la logverosmilitud.
+
+```{r}
+#J
+llik_inar<-function(vect,nu,alpha,return_fitted=FALSE){
+  upper_limit<-max(qpois(0.999,nu/(1-alpha)),round(1.5*max(vect)))
+  transition_matrix<-get_transition_matrix(nu=nu,alpha=alpha,upper_limit=upper_limit)
+  # Llamar la función anterior que calcula la matriz de transición.
+  llik_contributions<-fitted_vals<-fitted_vars<-numeric(length(vect))
+  # Creamos 3 vectores del tamaño del vector
+  llik_contributions[1]<-dpois(vect[1],nu/(1-alpha),log=TRUE)
+  # Inicializar la log verosimilitud
+  fitted_vals[1]<-fitted_vars[1]<-nu/(1-alpha)
+  for(t in 2:length(vect)){
+    llik_contributions[t]<-log(transition_matrix[vect[t-1]+1,vect[t]+1])
+      if(return_fitted){
+         fitted_vals[t]<-sum(transition_matrix[vect[t-1]+1,]*seq(from=0,length.out=nrow(transition_matrix)))
+        fitted_vars[t]<-sum(transition_matrix[vect[t-1]+1,]*seq(from=0,length.out=nrow(transition_matrix))^2)-fitted_vals[t]^2
+      }
+  }
+  llik<-sum(llik_contributions)
+  # Logverosimilitud total
+  if(return_fitted){
+     return(list(value=llik,fitted_vals=fitted_vals,fitted_vars=fitted_vars))
+  }else{
+     return(llik)
+  } # Retorna logverosimilitud, valores ajustados y varianza ajustada
+}
+```
+
+## Hidden INAR(1)
+
+Esta función se utiliza para calcular la logverosimilitud de un modelo INAR(1) oculto en función de *vect* un vector de series de tiempo observadas y de $\nu$, $\alpha$ y $q$ parámetros del modelo. Además, puede devolvere la logverosimilitud en escala logarítmica o no y, opcionalmente, una matríz de probabilidades adelante (foward probabilities). El objeto *upper_limit* se utiliza para determinar el tamaño de la matriz de transición y otros cálculos, este valor depende de los parámetros $\nu$, $\alpha$ y $q$, así como el valor máximo de transición en el vector de la serie de tiempo. El bucle recorre los pasos posteriores en la serie de tiempo, para cada paso en el bucle se calculan las probabilidades adelante utilizando la matríz de transición y las probabilidades adelante anteriores. Luego se almacenan en *fp* y se calculan las constantes de normalización que se almacenan en *normalizing*.
+
+```{r}
+#S
+llik_hidden_inar<-function(vect,nu,alpha,q,log=TRUE,return_fp=FALSE){
+  lgt<-length(vect) # Longitud de la serie vect 
+  upper_limit<-max(qpois(0.999,nu/(1-alpha)),round(1.5*max(vect)/q)) # upper_limit se
+  support<-0:upper_limit # Soporte de la distribución de Poisson (contiene valores enteros de 0 hasta upper_limit)
+  transition_matrix<-get_transition_matrix(nu=nu,alpha=alpha,upper_limit=upper_limit) # Calcular la matriz de transición
+  fp<-matrix(nrow=lgt,ncol=upper_limit+1) # Matriz vacía, almacena probabilidades hacia adelante (un paso)
+  normalizing<-numeric(lgt) # Matriz vacía, almacena constantes de normalización
+  probs_temp<-dpois(support,nu/(1-alpha))*dbinom(vect[1],support,q)
+  normalizing[1]<-sum(probs_temp)
+  fp[1,]<-probs_temp/normalizing[1]
+  for(i in 2:lgt){
+    probs_temp<-(fp[i-1,]%*%transition_matrix)*dbinom(vect[i],support,q)
+    normalizing[i]<-sum(probs_temp)
+    fp[i,]<-probs_temp/normalizing[i]
+  }
+  return_value<-ifelse(log,sum(log(normalizing)),prod(normalizing))
+  if(return_fp){
+     return(list(value=return_value,fp=fp))
+  }else{
+     return(return_value)
+  }
+}
+```
+
+## Modelo Hidden INAR(1)
+
+Teniendo en cuenta que *vect* es un vector que contiene la serie de tiempo, y *...* son argumentos que usa la función *optim*, esta función devuelve los parámetros del modelo, la logverosimilitud y la cantidad de parámetros.
+
+```{r}
+#S
+fit_hidden_inar<-function(vect, ...){ # Calcular la logverosimilitud negativa
+  nllik<-function(pars){
+    -llik_hidden_inar(vect,nu=exp(pars["log_nu"]),
+                      alpha=exp(pars["logit_alpha"])/(1+exp(pars["logit_alpha"])),
+                      q=exp(pars["logit_q"])/(1+exp(pars["logit_q"])))
+  }   # log_nu=2 y logit_alpha=0.5 son los valores iniciales 
+  opt<-optim(c(log_nu=2,logit_alpha=0.5,logit_q=0.5),nllik, ...)
+  llik<- -opt$value 
+  par<-c(tau=exp(opt$par["log_nu"]),
+         alpha=exp(opt$par["logit_alpha"])/(1+exp(opt$par["logit_alpha"])),
+         beta=exp(opt$par["logit_beta"])/(1+exp(opt$par["logit_beta"]))) # par tiene los valores de los parámetros que minimizan la logverosimilitud
+  names(par)<-c("nu","alpha","beta")
+  return(list(par=par,llik=llik,dim=3,opt=opt))
+}
+```
+
+## Reparametrización
+
+Esta función toma tres parámetros $\tau$, $\phi$ y $\kappa$, que son parámetros de un modelo INARMA(1,1). La función realizará una reparametrización y devolverá un objeto de lista con los parámetros $\nu$, $\alpha$ y $q$ del modelo INAR(1) oculto.
+
+```{r}
+#S
+reparam_inarma_to_hidden_inar <- function(tau, phi, kappa){
+  q_hidden <- phi*kappa/(1 - phi + phi*kappa)
+  nu_hidden <- tau*(1 - phi + phi*kappa)/kappa
+  alpha_hidden <- 1 - phi + phi*kappa
+  return(list(nu = nu_hidden,
+              alpha = alpha_hidden,
+              q = q_hidden))
+}
+```
+
+## Logverosimilitud del modelo INARMA(1,1)
+
+Teniendo en cuenta que *vect* contiene a la de tiempo, $\tau$, $\phi$ y $\kappa$ son parámetros del modelo INARMA(1,1), y $\phi$ y $\kappa$ definen a $\alpha$, y $\tau$ es la media de las innovaciones, esta función realiza una reparametrización a un modelo hidden INAR(1) y evalúa la logverosimilitud del hidden INAR(1) que sería la logverosimilitud del INARMA(1,1)
+
+```{r}
+#S
+llik_inarma<-function(vect,tau,phi,kappa,log=TRUE,return_fp=FALSE){ # Reparametrizar un modelo hidden INAR(1)
+  pars_hidden_inar<-reparam_inarma_to_hidden_inar(tau=tau,phi=phi,kappa=kappa) # Evaluar la logverosimilitud del hidden INAR(1)
+  llik_hidden_inar(vect=vect,nu=pars_hidden_inar$nu,alpha=pars_hidden_inar$alpha,
+                   q=pars_hidden_inar$q,log=log,return_fp=return_fp)
+}
+```
+
+# Modelo INARMA(1,1)
+
+Tomando en cuenta que *vect* contiene la serie de tiempo observada, *...* son los argumentos que pasan por la función *optim* y retorna la logverosimilitud, los parámetros que optimizan la logverosimilitud, la cantidad de parámetros y demás salidas de la función *optim*; esta función
+
+```{r}
+#S
+fit_inarma<-function(vect, ...){
+  nllik<-function(pars){ # Calcular la logverosimilitud negativa
+    -llik_inarma(vect,tau=exp(pars["log_tau"]),
+                 phi=exp(pars["logit_phi"])/(1+exp(pars["logit_phi"])),
+                 kappa=exp(pars["logit_kappa"])/(1+exp(pars["logit_kappa"])))
+  }
+  opt<-optim(c(log_tau=2,logit_phi=0.5,logit_kappa=0.5),nllik, ...)
+  llik<- -opt$value
+  par<-c(tau=exp(opt$par["log_tau"]),
+         phi=exp(opt$par["logit_phi"])/(1+exp(opt$par["logit_phi"])),
+         kappa=exp(opt$par["logit_kappa"])/(1+exp(opt$par["logit_kappa"]))) # par tiene los valores de los parámetros que minimizan la logverosimilitud
+  names(par)<-c("tau","phi","kappa")
+  return(list(par=par,llik=llik,dim=3,opt=opt))
+}
+```
+
+# Bases de datos
+
+## Mumps
+
+### Contextualización y gráfico de la serie de tiempo
+
+Esta base de datos corresponde a un conteo semanal de casos de paperas (mumps) en Bavaria, Alemania, cuenta con 209 registros y se recopilaron desde la primera semana de 2014 hasta la semana 52 del 2017. Los datos fueron tomados de (www.survstat.rki.de) el 8 de Octubre de 2018. A continuación se presenta la gráfica de la serie de tiempo.
+
+```{r}
+#J
+# Cargar la base de datos
+data_mumps <- read.csv("C:/Users/andre/OneDrive/Escritorio/Andrés/2023-2/Series de tiempo/Exposición/Aplicación/mumps_germany.csv") 
+
+# Gráfico de la serie de tiempo
+plot(data_mumps$time, data_mumps$Bavaria, type = "l", 
+     xlab = "Año", ylab = "Conteo semanal de casos",
+     main = "Paperas en Bavaria")
+```
+
+### ACF
+
+Como se puede ver, el ACF sugiere un proceso MA(1) **Pero si está bien**, y el PACF sugiere vdbsfh
+
+```{r}
+#J
+acf(data_mumps$Bavaria, lag.max = 15, ci.col = "black", main = "")
+text(10, 0.84, paste("Media =", round(mean(data_mumps$Bavaria), 2)))
+text(10, 0.61, paste("Varianza =", round(var(data_mumps$Bavaria), 2)))
+pacf(data_mumps$Bavaria)
+```
+
+## Muertes
+
+### Contextualización y gráfico de la serie de tiempo
+
+Esta base de datos corresponde al número mensual de conductores de vehículos ligeros fallecidos en Gran Bretaña, cuenta con 180 registros y se recopilaron desde enero de 1969 hasta diciembre de 1984. A continuación se presenta la gráfica de la serie de tiempo.
+
+```{r}
+#J
+# Cargar la base de datos
+data_muertes <- Seatbelts[, "VanKilled"]
+
+# Gráfico de la serie de tiempo
+plot(data_muertes, type = "l", 
+     xlab = "Tiempo", ylab = "Conteo de muertes en siniestros",
+     main = "Número de fallecimientos")
+```
+
+### ACF
+
+Como se puede ver, el ACF sugiere un proceso AR(1) **Pero si está bien**, y el PACF sugiere vdbsfh
+
+```{r}
+#J
+acf(data_muertes, lag.max = 30, ci.col = "black", main = "")
+pacf(data_muertes, lag.max = 15, ci.col = "black", main = "")
+```
+
+# Implementación a las bases de datos
+
+## Mumps
+
+```{r}
+#J
+# Ajuste de los modelos INAR(1) e INARMA(1,1)
+fit_mumps_inar <- fit_inar2(data_mumps$Bavaria)
+fit_mumps_inarma <- fit_inarma(data_mumps$Bavaria)
+
+# Comparar las estimaciones de los parametros
+fit_mumps_inar$par
+fit_mumps_inarma$par
+
+#Comparar los ajustes del modelo
+fit_mumps_inar$llik
+fit_mumps_inarma$llik
+
+# AICs
+-2*fit_mumps_inar$llik + 2*2
+-2*fit_mumps_inarma$llik + 2*3
+```
+
+## Muertes
+
+```{r}
+#J
+# Ajuste de los modelos INAR(1) e INARMA(1,1)
+fit_muertes_inar <- fit_inar2(as.vector(data_muertes))
+fit_muertes_inarma <- fit_inarma(as.vector(data_muertes))
+
+# Comparar las estimaciones de los parametros
+fit_muertes_inar$par
+fit_muertes_inarma$par
+
+# Comparar los ajustes del modelo
+fit_muertes_inar$llik
+fit_muertes_inarma$llik
+
+# AICs
+-2*fit_muertes_inar$llik + 2*2
+-2*fit_muertes_inarma$llik + 2*3
+```
+
+# Implementación utilizando GLM.
+
+## Base de datos Mumps
+
+Como se mencionó anteriormente, esta base de datos corresponde a un conteo semanal de casos de paperas (mumps) en Bavaria, Alemania, cuenta con 209 registros y se recopilaron desde la primera semana de 2014 hasta la semana 52 del 2017. Los datos fueron tomados de (www.survstat.rki.de) el 8 de Octubre de 2018. A continuación se presenta la gráfica de la serie de tiempo.
+
+```{r}
+#Ajustando los modelos poisson,log linear y binomial negativa
+mumpsfit_pois <- tsglm(data_mumps$Bavaria, model = list(past_obs = 1, past_mean = 52), distr = "poisson")
+mumpsfit_nbin <- tsglm(data_mumps$Bavaria, model = list(past_obs = 1, past_mean = 52), distr = "nbinom")
+mumpsfit_loglin <- tsglm(data_mumps$Bavaria,model = list(past_obs = 1,past_mean=52), link = "log", distr = "poisson")
+
+```
+
+```{r}
+## Obteniendo algunos resumenes y graficos.
+acf(residuals(mumpsfit_pois), main = "ACF of response residuals")
+acf(residuals(mumpsfit_nbin), main = "ACF of response residuals")
+acf(residuals(mumpsfit_loglin), main = "ACF of response residuals")
+
+```
+
+```{r}
+## Calculando algunas reglas de puntuación.
+rbind(Poisson = scoring(mumpsfit_pois), NegBin = scoring(mumpsfit_nbin),
+      LogLin = scoring(mumpsfit_loglin))
+#Valores AIC para comparar los modelos.
+summary(mumpsfit_pois)$AIC
+summary(mumpsfit_nbin)$AIC
+summary(mumpsfit_loglin)$AIC
+
+```
+
+Para este caso se tiene que el mejor es el ajustado utilizando la binomial negativa.
+
+```{r}
+## Resumen del modelo elegido
+summary(mumpsfit_nbin)
+
+```
+
+De este modo se tiene que el modelo dado por $Y_{t}|\mathcal{F_{t-1}}\sim NegBin(\lambda_{t},\phi=1/\hat{\sigma}^{2}=4.44)$ con:
+
+$$
+\lambda_{t}=2.10+0.155Y_{t-1}+8.74e^{-11}\lambda_{t-52}
+$$
+
+## Base de datos muerte.
+
+Como se menciono anteriormente, esta base de datos corresponde al número mensual de conductores de vehículos ligeros fallecidos en Gran Bretaña, cuenta con 180 registros y se recopilaron desde enero de 1969 hasta diciembre de 1984. A continuación se presenta la gráfica de la serie de tiempo.
+
+```{r}
+#Ajustando los modelos poisson,log linear y binomial negativa
+muertesfit_pois <- tsglm(data_muertes, model = list(past_obs = 1, past_mean = 13), distr = "poisson")
+muertesfit_nbin <- tsglm(data_muertes, model = list(past_obs = 1, past_mean = 13), distr = "nbinom")
+muertesfit_loglin <- tsglm(data_muertes,model = list(past_obs = 1,past_mean=13), link = "log", distr = "poisson")
+```
+
+```{r}
+##Ajustando otros modelos incluyendo retardos, el valor esperado condiconal y otras covaribales que pueden ayudar a explicar el proceso (Para ejemplificar lo que se puede incluir en los modelos).
+##Regresoras
+regressors <- cbind(PetrolPrice = Seatbelts[, c("PetrolPrice")])
+
+muertesfit_loglin_comp <- tsglm(data_muertes, model = list(past_obs = c(1,12), past_mean = c(1,12)), link = "log", distr = "poisson",xreg = regressors)
+```
+
+En el anterior código se ejemplifica una forma de ingresar varias variables regresoras, en este caso se introdujeron algunos retardos (1 y 12) y valores esperados condiconales no observados (1 y 12), estos teniendo en cuenta algunas caracteristicas de estacionalidad y con el fin de tener en cuenta la dependencia serial, además se incluyo como variable explicativa al precio del petroleo en dicho año.
+
+```{r}
+## Obteniendo algunos resumenes y graficos.
+acf(residuals(muertesfit_pois), main = "ACF of response residuals")
+acf(residuals(muertesfit_nbin), main = "ACF of response residuals")
+acf(residuals(muertesfit_loglin), main = "ACF of response residuals")
+acf(residuals(muertesfit_loglin_comp), main = "ACF of response residuals")
+
+```
+
+La función de autocorrelación para los modelos tenidos en cuenta no muestra la presencia de ninguna correlación serial o estacionalidad que no ha sido tenida en cuenta por los modelos (se sale en alguno puntos por muy poco, seria aconsejable tener en cuenta algunas intervenciones en la regresión)
+
+```{r}
+## Calculando algunas reglas de puntuación.
+rbind(Poisson = scoring(muertesfit_pois), NegBin = scoring(muertesfit_nbin),
+      LogLin = scoring(muertesfit_loglin),LogLinCom = scoring(muertesfit_loglin_comp))
+#Valores AIC para comparar los modelos.
+summary(muertesfit_pois)$AIC
+summary(muertesfit_nbin)$AIC
+summary(muertesfit_loglin)$AIC
+summary(muertesfit_loglin_comp)$AIC
+
+```
+
+Es posible observar que en la mayoria de estos criterios se tiene un menor valor en el modelamiento elaborado utilizando la Poisson con funcion de enlace log, e incluyendo más variables regresoras, por dicha razón procederemos con esta para observar la estimación de sus parametros.
+
+```{r}
+## Resumen del modelo elegido
+summary(muertesfit_loglin_comp)
+
+```
+
+Por lo tanto el modelo ajustado para el número de conductore de van muertos $Y_{t}$ en el mes t, viene dado por $Y_{t}|\mathcal{F_{t-1}}\sim Poiss(\lambda_{t})$ con:
+
+$$
+Log(\lambda_{t})=0.000365+0.040131Y_{t-1}+0.066111Y_{t-12}-0.1058\lambda_{t-1}+0.9994\lambda_{t-12}-0.5916X_{t}
+$$
